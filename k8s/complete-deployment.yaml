@@ -1,5 +1,6 @@
 # Complete Kubernetes deployment configuration
 # This file combines all resources for easy deployment
+# Note: Namespace is managed by Terraform, not included here
 ---
 apiVersion: apps/v1
 kind: Deployment

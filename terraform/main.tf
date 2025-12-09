@@ -57,6 +57,25 @@ module "monitoring" {
   ]
 }
 
+# Module 5: Prometheus Kubernetes Resources
+# Deploys Prometheus to EKS with AWS Managed Prometheus integration
+module "prometheus_k8s" {
+  source = "./modules/prometheus-k8s"
+
+  cluster_name                = var.cluster_name
+  prometheus_namespace        = kubernetes_namespace.prometheus.metadata[0].name
+  amp_ingest_role_arn         = module.monitoring.amp_ingest_role_arn
+  amp_query_role_arn          = module.monitoring.amp_query_role_arn
+  prometheus_remote_write_url = module.monitoring.prometheus_remote_write_url
+  aws_region                  = var.aws_region
+
+  depends_on = [
+    module.eks,
+    module.monitoring,
+    kubernetes_namespace.prometheus
+  ]
+}
+
 # Get current AWS account ID
 data "aws_caller_identity" "current" {}
 

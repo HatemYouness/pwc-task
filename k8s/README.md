@@ -1,22 +1,41 @@
 # Kubernetes Deployment Guide
 
-This directory contains Kubernetes manifests to deploy the microservices application.
+This directory contains Kubernetes manifests to deploy the microservices application and Prometheus monitoring.
 
 ## Files
 
-- `namespace.yaml` - Creates the microservices namespace
-- `deployment.yaml` - Deployment configuration for the app
-- `service.yaml` - LoadBalancer service to expose the app
-- `complete-deployment.yaml` - All-in-one deployment file
+### Application Deployment
+
+**`complete-deployment.yaml`**
+- Complete deployment configuration for the microservices application
+- Includes:
+  - Deployment with 2 replicas
+  - LoadBalancer Service (Network Load Balancer)
+  - Health probes (liveness and readiness)
+  - Resource limits and requests
+  - Prometheus scrape annotations
+- **Note**: Namespace `microservices` is managed by Terraform
+
+### Monitoring Stack
+
+**`prometheus-deployment.yaml`**
+- Complete Prometheus deployment for AWS Managed Prometheus integration
+- Includes:
+  - ConfigMap with comprehensive scrape configurations
+  - Deployment with proper security context
+  - Service (ClusterIP)
+  - Health probes and resource limits
+  - IRSA (IAM Roles for Service Accounts) integration
+- **Note**: Namespace `prometheus` and ServiceAccounts are managed by Terraform
 
 ## Prerequisites
 
-1. **EKS cluster is running** (provisioned via Terraform)
+1. **Terraform infrastructure deployed** (VPC, EKS cluster, monitoring stack)
 2. **kubectl configured** to connect to your cluster:
    ```bash
    aws eks update-kubeconfig --region us-east-1 --name microservices-eks-cluster
    ```
-3. **Docker image built and pushed** to a container registry (ECR, Docker Hub, etc.)
+3. **Docker image built and pushed** to ECR (via GitHub Actions or manually)
 
 ## Building and Pushing Docker Image
 
@@ -29,146 +48,276 @@ aws ecr get-login-password --region us-east-1 | docker login --username AWS --pa
 # Create ECR repository
 aws ecr create-repository --repository-name microservices-app --region us-east-1
 
-# Build Docker image
-cd ..
-docker build -t microservices-app:latest .
+## Deployment Order
 
-# Tag the image
-docker tag microservices-app:latest <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/microservices-app:latest
+### 1. Deploy Infrastructure (Terraform)
+```bash
+# Create S3 backend and DynamoDB table
+cd terraform/bootstrap
+terraform init && terraform apply
+
+# Deploy all infrastructure
+cd ..
+terraform init && terraform apply
+```
+
+This creates:
+- VPC and networking (single AZ, NAT gateway)
+- EKS cluster (1.28) with 1 t3.small node
+- ECR repository for Docker images
+- AWS Managed Prometheus workspace
+- AWS Managed Grafana workspace
+- Kubernetes namespaces: `microservices`, `prometheus`
+- ServiceAccounts with IAM roles for Prometheus (IRSA)
+
+### 2. Configure kubectl
+```bash
+aws eks update-kubeconfig --name microservices-eks-cluster --region us-east-1
+```
+
+### 3. Build and Push Docker Image
+
+**Using GitHub Actions (Recommended):**
+- Push code to GitHub
+- Workflow automatically builds and pushes to ECR on main branch
+
+**Manual Build:**
+```bash
+# Login to ECR
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
+
+# Build and tag
+cd ..
+docker build -t microservices-eks-cluster-app:latest .
+docker tag microservices-eks-cluster-app:latest $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/microservices-eks-cluster-app:latest
 
 # Push to ECR
-docker push <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/microservices-app:latest
+docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/microservices-eks-cluster-app:latest
 ```
 
-### Option 2: Using Docker Hub
+### 4. Update Image Reference
+
+Update the image in `complete-deployment.yaml`:
+```bash
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+sed -i.bak "s/<AWS_ACCOUNT_ID>/$AWS_ACCOUNT_ID/g" k8s/complete-deployment.yaml
+```
+
+### 5. Deploy Prometheus
 
 ```bash
-# Build Docker image
+# Deploy Prometheus resources
+kubectl apply -f k8s/prometheus-deployment.yaml
+
+# Get remote write URL from Terraform
+cd terraform
+REMOTE_WRITE_URL=$(terraform output -raw prometheus_remote_write_url)
 cd ..
-docker build -t <your-dockerhub-username>/microservices-app:latest .
 
-# Login to Docker Hub
-docker login
+# Update ConfigMap with actual remote write URL
+kubectl patch deployment prometheus -n prometheus \
+  -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"prometheus\",\"env\":[{\"name\":\"PROMETHEUS_REMOTE_WRITE_URL\",\"value\":\"$REMOTE_WRITE_URL\"}]}]}}}}"
 
-# Push to Docker Hub
-docker push <your-dockerhub-username>/microservices-app:latest
+# Or manually edit the ConfigMap and replace ${PROMETHEUS_REMOTE_WRITE_URL}
+kubectl edit configmap prometheus-config -n prometheus
+# Then restart: kubectl rollout restart deployment/prometheus -n prometheus
 ```
 
-## Deployment Steps
-
-### Step 1: Update the image in deployment files
-
-Replace `<YOUR_DOCKER_IMAGE>:<TAG>` in the YAML files with your actual image:
-- For ECR: `<AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/microservices-app:latest`
-- For Docker Hub: `<your-dockerhub-username>/microservices-app:latest`
-
-### Step 2: Deploy using individual files
-
+### 6. Deploy Application
 ```bash
-# Create namespace
-kubectl apply -f namespace.yaml
-
-# Deploy the application
-kubectl apply -f deployment.yaml
-
-# Create the service
-kubectl apply -f service.yaml
-```
-
-### Step 3: OR Deploy using the all-in-one file
-
-```bash
-kubectl apply -f complete-deployment.yaml
+kubectl apply -f k8s/complete-deployment.yaml
 ```
 
 ## Verify Deployment
 
+### Check Application
 ```bash
-# Check if namespace is created
-kubectl get namespaces
-
 # Check pods status
 kubectl get pods -n microservices
+kubectl get deployment -n microservices
+kubectl get svc -n microservices
 
-# Check deployment
-kubectl get deployments -n microservices
-
-# Check service
-kubectl get services -n microservices
+# View logs
+kubectl logs -n microservices -l app=microservices-app -f
 
 # Get detailed pod information
 kubectl describe pods -n microservices
-
-# View logs
-kubectl logs -n microservices -l app=microservices-app
 ```
 
-## Access the Application
-
+### Check Prometheus
 ```bash
-# Get the LoadBalancer external IP/DNS
-kubectl get service microservices-app-service -n microservices
+# Check Prometheus resources
+kubectl get pods -n prometheus
+kubectl get svc -n prometheus
+kubectl get configmap -n prometheus
 
-# Wait for EXTERNAL-IP to be assigned (may take a few minutes)
-# Access your app at: http://<EXTERNAL-IP>
+# View Prometheus logs
+kubectl logs -n prometheus deployment/prometheus -f
+
+# Verify ServiceAccount annotations
+kubectl get sa -n prometheus amp-iamproxy-ingest-service-account -o yaml
 ```
+
+
+## Access the Services
+
+### Application
+```bash
+# Get the Network Load Balancer DNS
+APP_URL=$(kubectl get svc microservices-app-service -n microservices -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "Application: http://$APP_URL"
+
+# Test endpoints
+curl http://$APP_URL/
+curl http://$APP_URL/users
+curl http://$APP_URL/products
+curl http://$APP_URL/metrics  # Prometheus metrics
+```
+
+### Prometheus (Internal Only)
+```bash
+# Port forward to access Prometheus UI locally
+kubectl port-forward -n prometheus svc/prometheus 9090:9090
+
+# Access at http://localhost:9090
+# Check targets at http://localhost:9090/targets
+# Check config at http://localhost:9090/config
+```
+
+### Grafana
+```bash
+# Get Grafana workspace URL from Terraform
+cd terraform
+terraform output grafana_workspace_endpoint
+
+# Access via AWS Console with SSO
+# Configure Prometheus data source in Grafana using AMP endpoint
+```
+
+## Monitoring Configuration
+
+### Application Metrics
+
+The application is configured to expose metrics at `/metrics` endpoint. Prometheus automatically discovers and scrapes pods with these annotations:
+
+```yaml
+annotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "5000"
+  prometheus.io/path: "/metrics"
+```
+
+### Adding Flask Metrics
+
+To expose detailed metrics from your Flask application:
+
+1. Install the Prometheus client:
+```bash
+pip install prometheus-flask-exporter
+```
+
+2. Add to your Flask app:
+```python
+from prometheus_flask_exporter import PrometheusMetrics
+
+app = Flask(__name__)
+metrics = PrometheusMetrics(app)
+```
+
+3. Rebuild and redeploy your Docker image
 
 ## Scaling
 
 ```bash
-# Scale to 3 replicas
+# Scale application to 3 replicas
 kubectl scale deployment microservices-app --replicas=3 -n microservices
 
 # Verify scaling
-kubectl get pods -n microservices
+kubectl get pods -n microservices -w
 ```
 
 ## Update Deployment
 
+### Via GitHub Actions (Recommended)
+Push changes to main branch and the workflow will automatically:
+1. Build new Docker image
+2. Push to ECR
+3. Update deployment (if configured)
+
+### Manual Update
 ```bash
 # After pushing a new image version
-kubectl set image deployment/microservices-app microservices-app=<NEW_IMAGE>:<NEW_TAG> -n microservices
+kubectl rollout restart deployment/microservices-app -n microservices
 
 # Check rollout status
 kubectl rollout status deployment/microservices-app -n microservices
+
+# View rollout history
+kubectl rollout history deployment/microservices-app -n microservices
 ```
 
 ## Troubleshooting
 
+### Application Issues
 ```bash
 # Check pod logs
-kubectl logs -n microservices <pod-name>
+kubectl logs -n microservices deployment/microservices-app --tail=100 -f
 
 # Get pod details
-kubectl describe pod -n microservices <pod-name>
+kubectl describe pod -n microservices -l app=microservices-app
 
 # Check events
 kubectl get events -n microservices --sort-by='.lastTimestamp'
 
+# Check resource usage
+kubectl top pods -n microservices
+
 # Access pod shell for debugging
-kubectl exec -it -n microservices <pod-name> -- /bin/sh
+kubectl exec -it -n microservices deployment/microservices-app -- /bin/sh
+```
+
+### Prometheus Issues
+```bash
+# Check if Prometheus is scraping targets
+kubectl port-forward -n prometheus svc/prometheus 9090:9090
+# Visit http://localhost:9090/targets
+
+# Check Prometheus logs
+kubectl logs -n prometheus deployment/prometheus --tail=100
+
+# Verify ConfigMap
+kubectl get configmap prometheus-config -n prometheus -o yaml
+
+# Check if remote write is working (look for errors in logs)
+kubectl logs -n prometheus deployment/prometheus | grep remote_write
+
+# Verify IAM role is attached to ServiceAccount
+kubectl describe sa amp-iamproxy-ingest-service-account -n prometheus
+```
+
+### Network Load Balancer Issues
+```bash
+# Check service
+kubectl describe svc microservices-app-service -n microservices
+
+# Verify NLB was created
+aws elbv2 describe-load-balancers --region us-east-1 | grep microservices
+
+# Check target group health (get ARN from AWS console)
+aws elbv2 describe-target-health --target-group-arn <ARN>
 ```
 
 ## Clean Up
 
 ```bash
-# Delete all resources
-kubectl delete -f complete-deployment.yaml
+# Delete application
+kubectl delete -f k8s/complete-deployment.yaml
 
-# Or delete individually
-kubectl delete -f service.yaml
-kubectl delete -f deployment.yaml
-kubectl delete -f namespace.yaml
+# Delete Prometheus
+kubectl delete -f k8s/prometheus-deployment.yaml
+
+# Delete infrastructure (Terraform)
+cd terraform
+terraform destroy -auto-approve
 ```
-
-## Resource Configuration
-
-The deployment includes:
-- **Replicas**: 2 pods for high availability
-- **Resources**: 
-  - Requests: 128Mi memory, 100m CPU
-  - Limits: 256Mi memory, 200m CPU
-- **Health Checks**:
-  - Liveness probe: Checks if app is running
-  - Readiness probe: Checks if app is ready to serve traffic
-- **Service Type**: LoadBalancer (creates AWS ELB automatically)
