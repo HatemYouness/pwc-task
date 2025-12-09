@@ -1,6 +1,5 @@
 # Complete Kubernetes deployment configuration
 # This file combines all resources for easy deployment
-# Note: Namespace is managed by Terraform, not included here
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -62,6 +61,8 @@ metadata:
   namespace: microservices
   labels:
     app: microservices-app
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
 spec:
   type: LoadBalancer
   selector:
